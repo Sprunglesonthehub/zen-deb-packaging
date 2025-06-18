@@ -1,0 +1,103 @@
+name: Build Zen Browser .deb Package from Release Tarball
+
+# This workflow runs when a new release is created in THIS repository
+on:
+  release:
+    types: [created]
+
+jobs:
+  build-package:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Checkout THIS repository to get our packaging files (.desktop, icon)
+      - name: Checkout packaging repository
+        uses: actions/checkout@v4
+
+      # Step 2: Download and Extract the Official Zen Browser Release
+      - name: Download and Extract Zen Browser
+        # Set environment variables for use in this step and subsequent ones
+        env:
+          # Get the version from the Git tag, removing the 'v' prefix (e.g., v1.2.3 -> 1.2.3)
+          ZEN_VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          # Construct the download URL based on Zen Browser's release pattern
+          DOWNLOAD_URL="https://github.com/zen-browser/desktop/releases/download/${ZEN_VERSION}/zen.linux-x86_64.tar.xz"
+          
+          echo "Downloading from ${DOWNLOAD_URL}"
+          curl -L --fail -o zen-browser.tar.xz "${DOWNLOAD_URL}"
+          
+          echo "Extracting archive..."
+          # Use 'J' for .xz files ('j' is for .bz2, 'z' is for .gz)
+          tar -xJvf zen-browser.tar.xz
+          # This should create a directory named 'zen'
+
+      # Step 3: Prepare the staging directory for the .deb package
+      - name: Prepare Packaging Directory
+        env:
+          DEB_VERSION: ${{ github.event.release.tag_name | replace('v', '') }}-1
+        run: |
+          # This is the root of our final package
+          export STAGING_DIR="deb_dist/zen-browser_${DEB_VERSION}_amd64"
+          echo "STAGING_DIR=${STAGING_DIR}" >> $GITHUB_ENV
+
+          mkdir -p "${STAGING_DIR}/DEBIAN"
+          # The application will be installed in /opt/zen-browser
+          mkdir -p "${STAGING_DIR}/opt/zen-browser"
+          # We'll create a symlink in /usr/bin for easy access
+          mkdir -p "${STAGING_DIR}/usr/bin"
+          # Directories for the application menu entry and icon
+          mkdir -p "${STAGING_DIR}/usr/share/applications"
+          mkdir -p "${STAGING_DIR}/usr/share/icons/hicolor/256x256/apps"
+
+      # Step 4: Create the Debian control file
+      - name: Create Debian Control File
+        env:
+          DEB_VERSION: ${{ github.event.release.tag_name | replace('v', '') }}-1
+        run: |
+          cat <<EOF > "${STAGING_DIR}/DEBIAN/control"
+          Package: zen-browser
+          Version: ${DEB_VERSION}
+          Architecture: amd64
+          Maintainer: Natalie Spiva <sprungles.me@proton.me>
+          Description: A privacy-respecting, a modern and minimalist of Firefox.
+           This package installs the Zen Browser into /opt.
+           It is packaged independently via the zen-deb-packaging repository. This is an unofficial build, as they don't provide Ubuntu Binaries.
+          Depends: libgtk-3-0, libdbus-glib-1-2, libxt6
+          EOF
+
+      # Step 5: Copy application files and our assets into the staging directory
+      - name: Assemble Files in Staging Directory
+        run: |
+          # Move the extracted application files to /opt/zen-browser
+          echo "Moving application files to ${STAGING_DIR}/opt/zen-browser"
+          mv zen/* "${STAGING_DIR}/opt/zen-browser/"
+          
+          # Create a symbolic link from /usr/bin/zen-browser to the actual executable in /opt
+          echo "Creating symlink in ${STAGING_DIR}/usr/bin"
+          ln -s /opt/zen-browser/zen "${STAGING_DIR}/usr/bin/zen-browser"
+          
+          # Copy our .desktop file (from this repo)
+          cp packaging/zen.desktop "${STAGING_DIR}/usr/share/applications/"
+          
+          # Copy our icon (from this repo), renaming it to match the .desktop file's Icon field
+          cp packaging/icons/zen-browser.png "${STAGING_DIR}/usr/share/icons/hicolor/256x256/apps/zen-browser.png"
+          
+      # Step 6: Build the final .deb package
+      - name: Build the .deb Package
+        env:
+          DEB_VERSION: ${{ github.event.release.tag_name | replace('v', '') }}-1
+        run: |
+          dpkg-deb --build "${STAGING_DIR}"
+          # Rename the output file to be more predictable
+          mv "${STAGING_DIR}.deb" "zen-browser_${DEB_VERSION}_amd64.deb"
+
+      # Step 7: Upload the .deb file to the release page of THIS repository
+      - name: Upload .deb to Release
+        env:
+          DEB_VERSION: ${{ github.event.release.tag_name | replace('v', '') }}-1
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./zen-browser_${DEB_VERSION}_amd64.deb
+          asset_name: zen-browser_${DEB_VERSION}_amd64.deb
+          asset_content_type: application/vnd.debian.binary-package
