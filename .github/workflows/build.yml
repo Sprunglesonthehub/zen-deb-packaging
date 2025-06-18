@@ -1,27 +1,31 @@
 # File: .github/workflows/build.yml
 
-name: Build Zen Browser .deb Package
+name: Build and Release Zen Browser .deb Package
 
-# This workflow has two triggers:
 on:
-  # 1. Manually from the Actions tab, allowing you to specify a version.
+  # 1. Manually from the Actions tab, to create a formal release.
   workflow_dispatch:
     inputs:
       zen_version:
         description: 'Zen Browser version tag to build (e.g., v1.2.3)'
         required: true
-        default: 'v1.2.3' # A sensible default
-  
+        default: 'v1.2.3'
+
   # 2. Automatically on every push to the main branch for testing.
   push:
     branches:
       - main
 
 jobs:
-  build-package:
+  build-and-release:
     runs-on: ubuntu-latest
+
+    # IMPORTANT: Add permissions for the GITHUB_TOKEN to create releases.
+    permissions:
+      contents: write # Needed to create releases and upload assets.
+
     steps:
-      # Step 1: Checkout THIS repository to get our packaging files (.desktop, icon)
+      # Step 1: Checkout packaging repository
       - name: Checkout packaging repository
         uses: actions/checkout@v4
 
@@ -29,13 +33,11 @@ jobs:
       - name: Determine Version
         id: get_version
         env:
-          GH_TOKEN: ${{ github.token }} # Provide token for the 'gh' CLI to work
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # If the workflow was triggered manually, use the provided input version.
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "Using manual input version: ${{ github.event.inputs.zen_version }}"
             echo "ZEN_VERSION=${{ github.event.inputs.zen_version }}" >> $GITHUB_ENV
-          # Otherwise (on a push), build a "dev" package from the latest official release.
           else
             echo "Push event detected. Fetching latest release tag for dev build."
             LATEST_TAG=$(gh release list --repo zen-browser/desktop --limit 1 --json tagName --jq '.[0].tagName')
@@ -51,29 +53,19 @@ jobs:
       - name: Download and Extract Zen Browser
         run: |
           DOWNLOAD_URL="https://github.com/zen-browser/desktop/releases/download/${{ env.ZEN_VERSION }}/zen.linux-x86_64.tar.xz"
-          
-          echo "Downloading from ${DOWNLOAD_URL}"
           curl -L --fail -o zen-browser.tar.xz "${DOWNLOAD_URL}"
-          
-          echo "Extracting archive..."
-          # Use 'J' for .xz files
           tar -xJvf zen-browser.tar.xz
-          # This creates a directory named 'zen'
 
       # Step 4: Prepare Packaging Directory and Debian Version
       - name: Prepare Packaging Directory and Version
         run: |
-          # Create a proper Debian version string. For pushes, add a timestamp.
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             DEB_VERSION=$(echo "${{ env.ZEN_VERSION }}" | sed 's/^v//')-1
           else
-            # For pushes, create a unique dev version like 1.2.3-1~dev202310271430
             TIMESTAMP=$(date -u +%Y%m%d%H%M)
             DEB_VERSION=$(echo "${{ env.ZEN_VERSION }}" | sed 's/^v//')-1~dev${TIMESTAMP}
           fi
           echo "DEB_VERSION=${DEB_VERSION}" >> $GITHUB_ENV
-
-          # Set up the staging directory path for use in later steps
           STAGING_DIR="deb_dist/zen-browser_${DEB_VERSION}_amd64"
           echo "STAGING_DIR=${STAGING_DIR}" >> $GITHUB_ENV
           mkdir -p "${STAGING_DIR}"/{DEBIAN,opt/zen-browser,usr/bin,usr/share/applications,usr/share/icons/hicolor/256x256/apps}
@@ -85,37 +77,54 @@ jobs:
           Package: zen-browser
           Version: ${{ env.DEB_VERSION }}
           Architecture: amd64
-          Maintainer: Natalie Spiva <sprungles.me@proton.me"
+          Maintainer: Your Name <your.email@example.com>
           Description: A privacy-respecting, minimalist fork of Firefox.
            This package installs the Zen Browser into /opt.
-           It is packaged independently via the zen-deb-packaging repository.
           Depends: libgtk-3-0, libdbus-glib-1-2, libxt6
           EOF
 
       # Step 6: Assemble Files in Staging Directory
       - name: Assemble Files
         run: |
-          # Move the extracted application files to /opt/zen-browser
           mv zen/* "${STAGING_DIR}/opt/zen-browser/"
-          # Create a symbolic link from /usr/bin/zen-browser for easy command-line access
           ln -s /opt/zen-browser/zen "${STAGING_DIR}/usr/bin/zen-browser"
-          # Copy our .desktop file (from this repo)
           cp packaging/zen.desktop "${STAGING_DIR}/usr/share/applications/"
-          # Copy our icon (from this repo), renaming it to match the .desktop file's Icon field
           cp packaging/icons/zen-browser.png "${STAGING_DIR}/usr/share/icons/hicolor/256x256/apps/zen-browser.png"
 
       # Step 7: Build the final .deb package
       - name: Build the .deb Package
         run: |
           dpkg-deb --build "${STAGING_DIR}"
-          # Rename the output file to a consistent name
           mv "${STAGING_DIR}.deb" "zen-browser_${{ env.DEB_VERSION }}_amd64.deb"
 
-      # Step 8: Upload .deb as a workflow artifact
-      # We upload as an artifact because a 'push' doesn't have a release page.
-      # The artifact can be downloaded from the workflow summary page.
-      - name: Upload .deb as an Artifact
+      # --- Conditional Final Step ---
+
+      # Step 8.A: Upload Artifact for 'push' events (for testing)
+      - name: Upload .deb as an Artifact for Test Builds
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: debian-package
           path: ./zen-browser_${{ env.DEB_VERSION }}_amd64.deb
+
+      # Step 8.B: Create Release for 'workflow_dispatch' events (for publishing)
+      - name: Create or Update GitHub Release and Upload Asset
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DEB_FILE="zen-browser_${{ env.DEB_VERSION }}_amd64.deb"
+          
+          # Check if a release for this tag already exists.
+          if ! gh release view ${{ env.ZEN_VERSION }} > /dev/null 2>&1; then
+            echo "Release ${{ env.ZEN_VERSION }} does not exist. Creating it."
+            gh release create ${{ env.ZEN_VERSION }} \
+              --title "Zen Browser ${{ env.ZEN_VERSION }}" \
+              --notes "Debian package for Zen Browser release ${{ env.ZEN_VERSION }}. See the original release at https://github.com/zen-browser/desktop/releases/tag/${{ env.ZEN_VERSION }}"
+          else
+            echo "Release ${{ env.ZEN_VERSION }} already exists. Uploading asset."
+          fi
+          
+          # Upload the .deb file to the release. The --clobber flag will overwrite the file if it already exists.
+          echo "Uploading ${DEB_FILE} to release ${{ env.ZEN_VERSION }}..."
+          gh release upload ${{ env.ZEN_VERSION }} "${DEB_FILE}" --clobber
