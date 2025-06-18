@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=Zen Browser
+Comment=A privacy-respecting, minimalist fork of Firefox.
+Exec=zen-browser
+Icon=zen-browser
+Terminal=false
+Type=Application
+Categories=Network;WebBrowser;
