@@ -3,128 +3,132 @@
 name: Build and Release Zen Browser .deb Package
 
 on:
-  # 1. Manually from the Actions tab, to create a formal release.
+  # 1. Manually from the Actions tab, to force a build of a specific version.
   workflow_dispatch:
     inputs:
       zen_version:
-        description: 'Zen Browser version tag to build (e.g., v1.2.3)'
+        description: 'Force build for a specific version tag (e.g., v1.2.3)'
         required: true
-        default: 'v1.2.3'
 
-  # 2. Automatically on every push to the main branch for testing.
-  push:
-    branches:
-      - main
+  # 2. On a schedule (e.g., daily at 05:00 UTC) to check for new releases.
+  schedule:
+    - cron: '0 5 * * *'
 
 jobs:
-  build-and-release:
+  # JOB 1: Check if there are new upstream releases to package.
+  check_for_new_releases:
     runs-on: ubuntu-latest
-
-    # IMPORTANT: Add permissions for the GITHUB_TOKEN to create releases.
+    # This job only needs to read contents.
     permissions:
-      contents: write # Needed to create releases and upload assets.
+      contents: read
+    outputs:
+      # This output will be a JSON array of version tags to build, e.g., ["v1.2.4", "v1.2.5"]
+      matrix: ${{ steps.generate_matrix.outputs.matrix }}
 
     steps:
-      # Step 1: Checkout packaging repository
-      - name: Checkout packaging repository
-        uses: actions/checkout@v4
-
-      # Step 2: Determine which version of Zen Browser to build
-      - name: Determine Version
-        id: get_version
+      - name: Generate matrix of new versions to build
+        id: generate_matrix
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # If this was a manual trigger, the matrix is just the single version provided by the user.
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "Using manual input version: ${{ github.event.inputs.zen_version }}"
-            echo "ZEN_VERSION=${{ github.event.inputs.zen_version }}" >> $GITHUB_ENV
+            echo "Manual trigger detected. Setting matrix for version: ${{ github.event.inputs.zen_version }}"
+            JSON_MATRIX=$(echo '${{ github.event.inputs.zen_version }}' | jq -R . | jq -s .)
+            echo "matrix=${JSON_MATRIX}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # If this is a scheduled run, compare upstream releases with our releases.
+          echo "Scheduled run detected. Comparing upstream releases with our own."
+          
+          # Get all release tags from the official Zen Browser repository.
+          UPSTREAM_RELEASES=$(gh release list --repo zen-browser/desktop --limit 100 --json tagName --jq '.[].tagName')
+          echo -e "Upstream releases found:\n${UPSTREAM_RELEASES}"
+          
+          # Get all release tags from our own packaging repository.
+          OUR_RELEASES=$(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          echo -e "Our packaged releases found:\n${OUR_RELEASES}"
+
+          # Find versions that exist upstream but not in our releases.
+          NEW_RELEASES=$(grep -v -F -x -f <(echo "${OUR_RELEASES}") <(echo "${UPSTREAM_RELEASES}"))
+          
+          if [ -z "$NEW_RELEASES" ]; then
+            echo "No new releases to package. Matrix will be empty."
+            echo "matrix=[]" >> $GITHUB_OUTPUT
           else
-            echo "Push event detected. Fetching latest release tag for dev build."
-            LATEST_TAG=$(gh release list --repo zen-browser/desktop --limit 1 --json tagName --jq '.[0].tagName')
-            if [ -z "$LATEST_TAG" ]; then
-              echo "::error::Could not fetch the latest release tag from zen-browser/desktop."
-              exit 1
-            fi
-            echo "Latest official release is ${LATEST_TAG}. Using it for dev build."
-            echo "ZEN_VERSION=${LATEST_TAG}" >> $GITHUB_ENV
+            echo -e "New releases to package:\n${NEW_RELEASES}"
+            # Convert the list of new releases into a proper JSON array for the matrix.
+            JSON_MATRIX=$(echo "${NEW_RELEASES}" | jq -R . | jq -s .)
+            echo "matrix=${JSON_MATRIX}" >> $GITHUB_OUTPUT
           fi
 
-      # Step 3: Download and Extract the Official Zen Browser Release
-      - name: Download and Extract Zen Browser
+  # JOB 2: Build and release a .deb for each version found in the matrix.
+  build_and_release:
+    # This job depends on the check job and will only run if the matrix is not empty.
+    needs: check_for_new_releases
+    if: needs.check_for_new_releases.outputs.matrix != '[]'
+    
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to create releases and upload assets.
+
+    # Use a matrix strategy to run this job for each new version.
+    strategy:
+      fail-fast: false # If one version fails to build, don't cancel the others.
+      matrix:
+        version: ${{ fromJson(needs.check_for_new_releases.outputs.matrix) }}
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@v4
+
+      - name: Download and Extract Zen Browser ${{ matrix.version }}
         run: |
-          DOWNLOAD_URL="https://github.com/zen-browser/desktop/releases/download/${{ env.ZEN_VERSION }}/zen.linux-x86_64.tar.xz"
+          DOWNLOAD_URL="https://github.com/zen-browser/desktop/releases/download/${{ matrix.version }}/zen.linux-x86_64.tar.xz"
+          echo "Downloading from ${DOWNLOAD_URL}"
           curl -L --fail -o zen-browser.tar.xz "${DOWNLOAD_URL}"
           tar -xJvf zen-browser.tar.xz
 
-      # Step 4: Prepare Packaging Directory and Debian Version
-      - name: Prepare Packaging Directory and Version
+      - name: Prepare Packaging Directory and Debian Version
         run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            DEB_VERSION=$(echo "${{ env.ZEN_VERSION }}" | sed 's/^v//')-1
-          else
-            TIMESTAMP=$(date -u +%Y%m%d%H%M)
-            DEB_VERSION=$(echo "${{ env.ZEN_VERSION }}" | sed 's/^v//')-1~dev${TIMESTAMP}
-          fi
+          DEB_VERSION=$(echo "${{ matrix.version }}" | sed 's/^v//')-1
           echo "DEB_VERSION=${DEB_VERSION}" >> $GITHUB_ENV
           STAGING_DIR="deb_dist/zen-browser_${DEB_VERSION}_amd64"
           echo "STAGING_DIR=${STAGING_DIR}" >> $GITHUB_ENV
           mkdir -p "${STAGING_DIR}"/{DEBIAN,opt/zen-browser,usr/bin,usr/share/applications,usr/share/icons/hicolor/256x256/apps}
 
-      # Step 5: Create the Debian Control File
-      - name: Create Debian Control File
+      - name: Create Debian Control File for ${{ matrix.version }}
         run: |
           cat <<EOF > "${STAGING_DIR}/DEBIAN/control"
           Package: zen-browser
           Version: ${{ env.DEB_VERSION }}
           Architecture: amd64
-          Maintainer: Your Name <your.email@example.com>
+          Maintainer: Natalie Spiva <sprungles.me@proton.me>
           Description: A privacy-respecting, minimalist fork of Firefox.
            This package installs the Zen Browser into /opt.
           Depends: libgtk-3-0, libdbus-glib-1-2, libxt6
           EOF
 
-      # Step 6: Assemble Files in Staging Directory
-      - name: Assemble Files
+      - name: Assemble Files in Staging Directory
         run: |
           mv zen/* "${STAGING_DIR}/opt/zen-browser/"
           ln -s /opt/zen-browser/zen "${STAGING_DIR}/usr/bin/zen-browser"
           cp packaging/zen.desktop "${STAGING_DIR}/usr/share/applications/"
           cp packaging/icons/zen-browser.png "${STAGING_DIR}/usr/share/icons/hicolor/256x256/apps/zen-browser.png"
 
-      # Step 7: Build the final .deb package
       - name: Build the .deb Package
         run: |
           dpkg-deb --build "${STAGING_DIR}"
           mv "${STAGING_DIR}.deb" "zen-browser_${{ env.DEB_VERSION }}_amd64.deb"
 
-      # --- Conditional Final Step ---
-
-      # Step 8.A: Upload Artifact for 'push' events (for testing)
-      - name: Upload .deb as an Artifact for Test Builds
-        if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
-        with:
-          name: debian-package
-          path: ./zen-browser_${{ env.DEB_VERSION }}_amd64.deb
-
-      # Step 8.B: Create Release for 'workflow_dispatch' events (for publishing)
-      - name: Create or Update GitHub Release and Upload Asset
-        if: github.event_name == 'workflow_dispatch'
+      - name: Create GitHub Release and Upload Asset for ${{ matrix.version }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           DEB_FILE="zen-browser_${{ env.DEB_VERSION }}_amd64.deb"
-          
-          # Check if a release for this tag already exists.
-          if ! gh release view ${{ env.ZEN_VERSION }} > /dev/null 2>&1; then
-            echo "Release ${{ env.ZEN_VERSION }} does not exist. Creating it."
-            gh release create ${{ env.ZEN_VERSION }} \
-              --title "Zen Browser ${{ env.ZEN_VERSION }}" \
-              --notes "Debian package for Zen Browser release ${{ env.ZEN_VERSION }}. See the original release at https://github.com/zen-browser/desktop/releases/tag/${{ env.ZEN_VERSION }}"
-          else
-            echo "Release ${{ env.ZEN_VERSION }} already exists. Uploading asset."
-          fi
-          
-          # Upload the .deb file to the release. The --clobber flag will overwrite the file if it already exists.
-          echo "Uploading ${DEB_FILE} to release ${{ env.ZEN_VERSION }}..."
-          gh release upload ${{ env.ZEN_VERSION }} "${DEB_FILE}" --clobber
+          echo "Creating release for tag ${{ matrix.version }} and uploading ${DEB_FILE}..."
+          gh release create ${{ matrix.version }} \
+            --title "Zen Browser ${{ matrix.version }}" \
+            --notes "Debian package for Zen Browser release ${{ matrix.version }}. See the original release at https://github.com/zen-browser/desktop/releases/tag/${{ matrix.version }}" \
+            "${DEB_FILE}"
