@@ -18,7 +18,6 @@ jobs:
   # JOB 1: Check if there are new upstream releases to package.
   check_for_new_releases:
     runs-on: ubuntu-latest
-    # This job only needs to read contents.
     permissions:
       contents: read
     outputs:
@@ -42,15 +41,15 @@ jobs:
           # If this is a scheduled run, compare upstream releases with our releases.
           echo "Scheduled run detected. Comparing upstream releases with our own."
           
-          # Get all release tags from the official Zen Browser repository.
+          # THIS IS THE KEY STEP: Fetches all release tags from the official Zen Browser repository.
           UPSTREAM_RELEASES=$(gh release list --repo zen-browser/desktop --limit 100 --json tagName --jq '.[].tagName')
           echo -e "Upstream releases found:\n${UPSTREAM_RELEASES}"
           
-          # Get all release tags from our own packaging repository.
+          # Fetches all release tags from our own packaging repository to see what we've already done.
           OUR_RELEASES=$(gh release list --limit 100 --json tagName --jq '.[].tagName')
           echo -e "Our packaged releases found:\n${OUR_RELEASES}"
 
-          # Find versions that exist upstream but not in our releases.
+          # Compares the two lists to find versions that exist upstream but not in our releases.
           NEW_RELEASES=$(grep -v -F -x -f <(echo "${OUR_RELEASES}") <(echo "${UPSTREAM_RELEASES}"))
           
           if [ -z "$NEW_RELEASES" ]; then
@@ -58,14 +57,13 @@ jobs:
             echo "matrix=[]" >> $GITHUB_OUTPUT
           else
             echo -e "New releases to package:\n${NEW_RELEASES}"
-            # Convert the list of new releases into a proper JSON array for the matrix.
+            # Converts the list of new releases into a proper JSON array for the next job's matrix.
             JSON_MATRIX=$(echo "${NEW_RELEASES}" | jq -R . | jq -s .)
             echo "matrix=${JSON_MATRIX}" >> $GITHUB_OUTPUT
           fi
 
-  # JOB 2: Build and release a .deb for each version found in the matrix.
+  # JOB 2: Build and release a .deb for each version found by the check job.
   build_and_release:
-    # This job depends on the check job and will only run if the matrix is not empty.
     needs: check_for_new_releases
     if: needs.check_for_new_releases.outputs.matrix != '[]'
     
@@ -73,9 +71,9 @@ jobs:
     permissions:
       contents: write # Needed to create releases and upload assets.
 
-    # Use a matrix strategy to run this job for each new version.
+    # This strategy creates a parallel job for each new version tag found.
     strategy:
-      fail-fast: false # If one version fails to build, don't cancel the others.
+      fail-fast: false
       matrix:
         version: ${{ fromJson(needs.check_for_new_releases.outputs.matrix) }}
 
@@ -85,12 +83,13 @@ jobs:
 
       - name: Download and Extract Zen Browser ${{ matrix.version }}
         run: |
+          # The download URL uses the version from the matrix.
           DOWNLOAD_URL="https://github.com/zen-browser/desktop/releases/download/${{ matrix.version }}/zen.linux-x86_64.tar.xz"
           echo "Downloading from ${DOWNLOAD_URL}"
           curl -L --fail -o zen-browser.tar.xz "${DOWNLOAD_URL}"
           tar -xJvf zen-browser.tar.xz
 
-      - name: Prepare Packaging Directory and Debian Version
+      - name: Prepare Packaging Directory
         run: |
           DEB_VERSION=$(echo "${{ matrix.version }}" | sed 's/^v//')-1
           echo "DEB_VERSION=${DEB_VERSION}" >> $GITHUB_ENV
@@ -104,13 +103,13 @@ jobs:
           Package: zen-browser
           Version: ${{ env.DEB_VERSION }}
           Architecture: amd64
-          Maintainer: Natalie Spiva <sprungles.me@proton.me>
+          Maintainer: Your Name <your.email@example.com>
           Description: A privacy-respecting, minimalist fork of Firefox.
            This package installs the Zen Browser into /opt.
           Depends: libgtk-3-0, libdbus-glib-1-2, libxt6
           EOF
 
-      - name: Assemble Files in Staging Directory
+      - name: Assemble Files
         run: |
           mv zen/* "${STAGING_DIR}/opt/zen-browser/"
           ln -s /opt/zen-browser/zen "${STAGING_DIR}/usr/bin/zen-browser"
@@ -127,7 +126,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           DEB_FILE="zen-browser_${{ env.DEB_VERSION }}_amd64.deb"
-          echo "Creating release for tag ${{ matrix.version }} and uploading ${DEB_FILE}..."
+          # This command uses the version from the matrix to create a matching release tag and title in your repository.
           gh release create ${{ matrix.version }} \
             --title "Zen Browser ${{ matrix.version }}" \
             --notes "Debian package for Zen Browser release ${{ matrix.version }}. See the original release at https://github.com/zen-browser/desktop/releases/tag/${{ matrix.version }}" \
